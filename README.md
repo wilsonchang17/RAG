@@ -16,10 +16,10 @@ LangChain + FAISS 快速實作 RAG 系統範例
 2. 切分文件（Chunking）：由於LLM對單次輸入的長度有限制，而且直接對長文搜尋效率低，因此需要將長文件切分成多個片段 ￼。可使用 LangChain 提供的文字切分器（如RecursiveCharacterTextSplitter）來將文件切成適當大小的chunk（例如每個chunk約5001000個字元），並可設定一定程度的重疊（overlap，例如50100字元）以保留段落銜接的上下文。切分後，每個文件chunk會作為獨立的語意單位，方便後續向量檢索。這步驟能避免段落過長無法放入LLM上下文窗口的問題 ￼。
 
 3. 向量嵌入（Embedding）：接下來，對每個文件chunk計算其向量表示。選擇一個適當的文字嵌入模型（embedding model）將文本轉換為高維度向量。常用做法是使用OpenAI提供的文字嵌入模型（例如text-embedding-ada-002），透過OpenAI的SDK介面來取得向量表示。每個chunk會對應到一個向量，高維向量能夠捕捉該段文字的語意。LangChain中可以直接使用OpenAIEmbeddings類別來生成嵌入向量 ￼。例如：
-
+```python
 from langchain.embeddings import OpenAIEmbeddings
 embeddings = OpenAIEmbeddings()  # 使用預設的OpenAI嵌入模型 (text-embedding-ada-002)
-
+```
 上述程式會為每段文本產生向量表示，維度通常為1536（以ADA模型為例）。
 
 建立向量資料庫（FAISS）
@@ -27,20 +27,20 @@ embeddings = OpenAIEmbeddings()  # 使用預設的OpenAI嵌入模型 (text-embed
 有了文件chunk及其向量，下一步是建立向量索引資料庫以支援相似度檢索。這裡我們採用FAISS（Facebook AI Similarity Search）作為本地的向量資料庫。FAISS能在記憶體中高效地執行向量相似度搜尋，無需外部服務，適合快速開發原型。
 
 1. 建立FAISS索引：透過LangChain的向量庫介面，可以很方便地將嵌入向量存入FAISS。使用FAISS.from_documents方法，傳入文件片段列表和對應的嵌入模型，即可自動建構出FAISS索引 ￼。例如：
-
+```python
 from langchain.vectorstores import FAISS
-
+```
 # docs 為前述切分後的 Document 清單
 vector_store = FAISS.from_documents(docs, embeddings)
 
 上述程式會計算所有docs的向量（若尚未計算）並建立一個FAISS索引，將每個chunk向量存入（同時保存對應的文本內容）。完成後，我們就擁有一個本地的向量資料庫，可用於相似度檢索。
 
 2. （可選）儲存與載入索引：若SOP文件量較大，建索引可能耗時。FAISS支援將索引保存到本地檔案，日後直接載入使用，而不必每次重建。例如：
-
+```python
 vector_store.save_local("sop_faiss_index")
 # 之後可用 FAISS.load_local 載入
 new_store = FAISS.load_local("sop_faiss_index", embeddings)
-
+```
 這樣可以將索引建立與查詢解耦，提高系統啟動速度（本範例簡單起見可不特別實作保存）。
 
 檢索與問答整合 (Retriever + LLM Chain)
@@ -48,17 +48,17 @@ new_store = FAISS.load_local("sop_faiss_index", embeddings)
 向量索引建立後，就可以使用它來進行檢索，並串接LLM產生答案。
 
 1. 構建 Retriever：LangChain 向量庫物件提供了as_retriever()方法，可將FAISS索引包裝成Retriever介面。可以設定檢索時參數，如search_type="similarity"以及返回文檔數量k等。例えば：
-
+```python
 retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 5})
-
+```
 此設定代表每次查詢會返回前5個與問題最相關的文本片段。檢索器會計算使用者問題的向量，與資料庫中所有chunk向量計算相似度，找出分數最高的幾個。
 
 2. 建立問答鏈（QA Chain）：LangChain提供了高階鏈（Chain）來整合檢索與LLM。最簡單的是使用RetrievalQA鏈：將LLM模型和上面建立的retriever傳入即可。 ￼此鏈在執行時會自動完成「檢索→組合提示→LLM產生回答」的過程。我們可以使用公司內部的LLM接口（OpenAI SDK相容）來初始化一個LLM對象。假設公司的模型以OpenAI API方式提供，可以使用ChatOpenAI類別（搭配對應的API金鑰與參數）來呼叫。例如：
-
+```python
 from langchain.chat_models import ChatOpenAI
 llm = ChatOpenAI(model="gpt-4", temperature=0)  # 可換成內部模型名稱
 qa_chain = RetrievalQA(llm=llm, retriever=retriever)
-
+```
 上述qa_chain即為一個結合檢索器與LLM的問答鏈。當呼叫qa_chain.run(<使用者問題>)時，鏈會先用Retriever從FAISS中找出相關的SOP段落，再將問題+段落內容一起組裝提示給LLM，讓LLM產生包含根據文件資訊的答案 ￼。這實現了RAG流程中「檢索相關知識後生成回答」的自動化 ￼。開發者也可自行調整提示模板，要求模型在回答中引用文件內容或來源，但基本原理相同。
 
 範例程式碼樣板
@@ -284,7 +284,7 @@ A: 請直接轉接給財務部門（Accounts team）。
 ⸻
 
 🧪 範例練習資料（你可以複製下面這段當第一個測試）
-
+```
 【Customer Inquiries SOP】
 
 1. 問題判斷：
@@ -300,7 +300,7 @@ A: 請直接轉接給財務部門（Accounts team）。
    - 是 → 轉接財務部。
    - 否 → 記錄並傳送給銷售部（用團隊App）。
 
-
+```
 ⸻
 
 需要我幫你用 OCR 工具提取其他圖片的話，也可以幫忙處理。
