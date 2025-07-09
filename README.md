@@ -301,7 +301,122 @@ A: 請直接轉接給財務部門（Accounts team）。
    - 否 → 記錄並傳送給銷售部（用團隊App）。
 
 ```
+⸻⸻⸻⸻⸻⸻⸻⸻⸻⸻⸻⸻⸻⸻⸻⸻⸻⸻
+# STL
+
+核心原理先講清楚
+	1.	異質分段 (Regime) 先處理
+	•	你的數列明顯有三段不同均值／變異度。
+	•	若不先分段就直接算整體平均 → 高低段會互相稀釋，任何閾值都會偏離真相。
+	•	可用已知分段；若實務上分段未知，可用 PELT、Binary Segmentation 或 Bayesian Online Change-Point Detection 找轉折點。
+	2.	在「同質」段內定義 Outlier
+	•	一段數據可以近似「固定位置 + 噪音」。
+	•	Outlier 就是「噪音」遠超過典型範圍的點。必要要件：
+	1.	位置統計量：平均或中位數。
+	2.	離散度統計量：標準差、IQR、MAD (對極端值最不敏感)。
+	•	通常選用 MAD（Median Absolute Deviation）再轉成 Robust Z-Score：
+\[
+z_i^\* = \frac{\,x_i - \text{median}\,}{1.4826 \times \text{MAD}}
+\]
+只要 \(|z_i^\*| > 3\)（或業務上更嚴格的 2.5、3.5）即可標記為異常。
+	3.	簡明步驟
+```python
+import numpy as np
+
+def robust_outliers(segment, thresh=3):
+    med = np.median(segment)
+    mad = np.median(np.abs(segment - med))
+    z = 1.4826 * (segment - med) / (mad if mad != 0 else 1e-9)
+    return np.where(np.abs(z) > thresh)[0]  # 回傳 index
+```
+	•	對三段各跑一次 robust_outliers；回傳的索引就是異常點在該段中的位置。
+	•	若段長很短，MAD 可能為 0，需加上微小值避免除零。
+
+	4.	其他同樣好用（視場景挑選）
+
+思路	方法	適合情況
+距離基準	IQR (箱形圖)	小樣本、分佈對稱
+機率模型	ARIMA／Prophet 殘差檢測	有季節性或趨勢
+樹模型	Isolation Forest	多維特徵、數列不須強序性
+密度模型	LOF／DBSCAN	有聚簇結構、多維資料
+統計檢定	GESD / Grubbs	完全假設常態、樣本 > 25
+
+
+	5.	實務建議
+	•	先用最簡單 MAD → 人眼核對 → 再決定要不要換更複雜模型。
+	•	閾值不要死守 3；可用業務容忍度或 K-sigma 法調整。
+	•	若資料量大或分段很多，可把上述流程封裝成函式，批次跑完再人工複核。
+
+這樣就能在三段各自判定並標記異常點，避免高、中、低段互相干擾。
+
+整套「先分段再找異常」的全自動流程
+
+適用情境：序列中段落（regime）數量未知，且各段平均值/變異度差異明顯。
+思路：① 用變點偵測（Change-Point Detection）先切段 → ② 於每一段內跑魯棒異常值檢測。
+
 ⸻
 
-需要我幫你用 OCR 工具提取其他圖片的話，也可以幫忙處理。
-有了這個文字後，你就可以走 LangChain 的 standard RAG 流程了。要不要我也幫你生一份 .txt 版可以直接載入的文件？
+1. 變點偵測：自動把序列切成同質段
+
+類型	推薦演算法	長處	何時用
+離線（一次性）	PELT、Binary Seg、Bottom-Up（皆含於 ruptures）	O(n) ~ O(n log n)，速度快，可設定懲罰自動決定段數	批次資料、長度上萬也 OK
+線上（串流）	Bayesian Online Change-Point Detection（bocd 套件）	到點即判斷、遞迴更新，適合即時監控	需要邊收邊判斷時
+
+示範（ruptures + PELT）：  ￼
+```python
+import numpy as np, ruptures as rpt
+
+ts = np.array([...])               # 你的原始序列
+model = "rbf"                      # 均值或變異同時改變時常用
+algo  = rpt.Pelt(model=model).fit(ts)
+
+# pen = β 控制段數；可用 BIC ≈ 3*log(n) 或手動調
+break_pts = algo.predict(pen=3*np.log(len(ts)))
+# e.g., [8, 14, 21] 代表 0–7, 8–13, 14–20 為三段
+```
+若需線上： pip install bocd → 參考範例即可  ￼。
+
+調 β（penalty）的簡易做法
+	•	從大到小掃描 β，畫「段數 vs β」折線；折線明顯拐點通常是合理段數（elbow method）。
+	•	或先估一個最大可接受段數 max_k，直接 algo.predict(k=max_k) 然後人工調低。
+
+⸻
+
+2. 段內異常值：用 MAD Robust Z-Score
+```python
+def robust_z_outliers(arr, thresh=3):
+    med = np.median(arr)
+    mad = np.median(np.abs(arr - med))
+    z = 1.4826 * (arr - med) / (mad or 1e-9)
+    return np.where(np.abs(z) > thresh)[0]          # 回傳在段內的索引
+
+segments = np.split(ts, break_pts[:-1])             # 切段
+global_outliers = []
+start = 0
+for seg in segments:
+    idx_local = robust_z_outliers(seg)
+    global_outliers += list(start + idx_local)      # 轉成全域索引
+    start += len(seg)
+print("Outlier indices:", global_outliers)
+
+為何選 MAD？ 對極端值最不敏感；小樣本也穩定。
+必要時改用 IQR、Isolation Forest、或針對季節性殘差做檢測。
+```
+⸻
+
+3. 還有兩個常見加強點
+	1.	迭代式修正
+	•	先切段 → 段內去掉異常 → 重跑變點偵測（可去除「單點極端值造成假變點」的誤判）。
+	2.	聯合模型
+	•	直接建「階梯均值 + 稀疏異常項」的貝式模型（如 R-BEAST 或 Bayesian piecewise regression），一次輸出段落及 outlier  ￼。
+	•	好處：變點與異常互不干擾，但計算較重。
+
+⸻
+
+一頁結論
+	1.	先用 ruptures.Pelt 自動切段（β ≈ 3 log n 起手）。
+	2.	每段跑 MAD-Z > 3 判定 outlier。
+	3.	如有串流需求，改用 bocd 線上偵測。
+	4.	段數、β、Z 閾值都可依業務風險做微調；工具選擇簡：ruptures → bocd → 進階貝式。
+
+照此流程，程式即可 自動決定段落 + 段內異常值，不用事先知道到底有幾段。祝開發順利!
