@@ -66,6 +66,9 @@ qa_chain = RetrievalQA(llm=llm, retriever=retriever)
 下面提供一個完整的簡易RAG系統程式碼範例（使用LangChain + FAISS），包含文件載入、建立向量索引，以及QA查詢整合。請依需求安裝相應套件並替換API金鑰與文件路徑：
 
 # 安裝必要套件： langchain, openai, faiss-cpu, PyPDF2 (如需PDF載入)
+<pre>
+
+```python
 !pip install langchain openai faiss-cpu PyPDF2
 
 import os
@@ -101,7 +104,9 @@ query = "客戶要退款怎麼處理？"                    # 使用者的自然
 result = qa_chain.run(query)
 print("Q:", query)
 print("A:", result)
+```
 
+</pre>
 執行上述程式後，系統會從預先建立的SOP向量資料庫中檢索與問題相關的內容段落，並由內部的LLM生成答案。例如，對於問題「客戶要退款怎麼處理？」，AI Agent可能會在SOP文件中找到退款流程的相關段落，然後給出一步一步的處理說明。整套流程快速整合了檢索與生成： ￼文本片段經OpenAI嵌入產生向量並存入FAISS，查詢時檢索相關片段後由LLM根據片段內容產生回答 ￼。這樣的RAG架構實作簡潔且有效，工程師可以在此基礎上擴展功能，例如增加更多文件、調整檢索參數或自訂回答格式等。
 
 來源: 參考了LangChain官方文件與範例程式碼 ￼ ￼ ￼ ￼，以上內容說明了如何使用LangChain結合FAISS及OpenAI接口，快速實作一個能查詢SOP文件並回答問題的RAG系統。
