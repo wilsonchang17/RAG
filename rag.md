@@ -146,7 +146,7 @@ Additional Suggestions & Considerations
 
 By implementing the above, your agent will be able to retrieve the correct SOP and solution steps for a detected anomaly and present them to the engineer, all running locally. This ensures that when the engineer provides FDC abnormal data, the agent responds with a solid SOP-based solution. Good luck with your RAG tool implementation!
 
-
+## 用sentence-transfoemers的方風
 ```python
 # file: octotools/tools/sop_retrieval_tool/tool.py
 import os
