@@ -143,3 +143,205 @@ Additional Suggestions & Considerations
 	•	No Fancy Frameworks Needed: This setup avoids complex frameworks – it uses direct embedding computation and FAISS for similarity search. It fits well with your minimal-resource requirement and can be integrated into the OctoTools agent by treating it as just another tool or a pre-processing step before calling the LLM.
 
 By implementing the above, your agent will be able to retrieve the correct SOP and solution steps for a detected anomaly and present them to the engineer, all running locally. This ensures that when the engineer provides FDC abnormal data, the agent responds with a solid SOP-based solution. Good luck with your RAG tool implementation!
+
+
+```python
+# file: octotools/tools/sop_retrieval_tool/tool.py
+import os
+import json
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
+from octotools.tools.base import BaseTool
+
+class SOP_Retrieval_Tool(BaseTool):
+    """
+    A lightweight Retrieval-Augmented tool for fetching the most relevant SOP snippet
+    (from local txt files) given an engineer's anomaly query.
+    """
+
+    require_llm_engine = False   # 只做檢索，不直接呼叫 LLM
+
+    def __init__(
+        self,
+        sop_folder: str = "data/sop_texts",
+        model_name: str = "paraphrase-multilingual-MiniLM-L12-v2",
+        top_k: int = 1,
+    ):
+        """
+        Args:
+            sop_folder: 本地存放多個 .txt SOP 檔案的資料夾。
+            model_name: Sentence-Transformer embedding 模型名稱。
+            top_k: 每次查詢要回傳前 k 個最相關片段。
+        """
+        super().__init__(
+            tool_name="SOP_Retrieval_Tool",
+            tool_description=(
+                "Retrieves the most relevant SOP paragraph(s) for a given anomaly-related "
+                "query using local FAISS vector search."
+            ),
+            tool_version="1.0.0",
+            input_types={
+                "query": "str - The anomaly description or user question to search for.",
+            },
+            output_type="str - The retrieved SOP paragraph(s).",
+            demo_commands=[
+                {
+                    "command": 'execution = tool.execute(query="腔體溫度飄移 如何處理")',
+                    "description": "Retrieve SOP steps for chamber temperature drift."
+                },
+                {
+                    "command": 'execution = tool.execute(query="MFC 流量異常 SOP")',
+                    "description": "Retrieve SOP for MFC flow anomaly."
+                },
+            ],
+            user_metadata={
+                "limitation": (
+                    "本工具僅依照向量相似度取前 k 個片段，若 SOP 文檔極度冗長或關鍵字差異很大，"
+                    "可能需要調整 chunking 或加入同義詞。"
+                ),
+                "best_practice": (
+                    "1) 保持 SOP txt 檔案最新；2) SOP 文字建議依段落或條列分段，提升檢索精度；"
+                    "3) 若新增/修改 SOP 檔案，重新載入工具或呼叫 rebuild_index(True)。"
+                )
+            },
+        )
+
+        self.sop_folder = sop_folder
+        self.model_name = model_name
+        self.top_k = top_k
+
+        # 延遲載入：第一次真正查詢時才建 index，可縮短 agent 啟動時間
+        self._index_built = False
+        self._index = None
+        self._doc_texts = []
+        self._emb_model = None
+
+    # ------------------------------------------------------------------
+    # Public API —— agent 只會呼叫 execute()
+    # ------------------------------------------------------------------
+    def execute(self, query: str):
+        """
+        Return top-k relevant SOP text chunks for the given query.
+        """
+        if not query or not isinstance(query, str):
+            return "Error: `query` must be a non-empty string."
+
+        # 如有需要，先建索引（僅一次）
+        if not self._index_built:
+            ok, msg = self._build_index()
+            if not ok:
+                return f"Error building SOP index: {msg}"
+
+        # 1. 對 query 做 embedding
+        q_vec = self._emb_model.encode(query).astype("float32").reshape(1, -1)
+
+        # 2. 在 FAISS 中搜尋
+        try:
+            distances, indices = self._index.search(q_vec, self.top_k)
+        except Exception as e:
+            return f"Error while searching FAISS index: {str(e)}"
+
+        # 3. 組回覆
+        retrieved = []
+        for idx in indices[0]:
+            if idx < len(self._doc_texts):
+                retrieved.append(self._doc_texts[idx])
+
+        if not retrieved:
+            return "No relevant SOP found."
+
+        # 用 --- 分隔多段，回傳給上層 LLM prompt 或直接展出
+        return "\n---\n".join(retrieved)
+
+    # ------------------------------------------------------------------
+    # Helper: build / rebuild index (可在代碼內部或手動呼叫)
+    # ------------------------------------------------------------------
+    def _build_index(self):
+        """
+        Load all txt files, split into chunks, embed, and build FAISS index.
+        Returns (ok: bool, message: str)
+        """
+        if not os.path.isdir(self.sop_folder):
+            return False, f"SOP folder not found: {self.sop_folder}"
+
+        # 1) 讀檔 & chunk
+        texts = []
+        for fname in os.listdir(self.sop_folder):
+            if fname.endswith(".txt"):
+                path = os.path.join(self.sop_folder, fname)
+                with open(path, "r", encoding="utf-8") as f:
+                    txt = f.read().strip()
+                # 以兩個以上換行或 '【' 標題切段
+                chunks = [c.strip() for c in txt.split("\n\n") if c.strip()]
+                texts.extend(chunks)
+
+        if not texts:
+            return False, "No SOP txt files or chunks found."
+
+        # 2) 產生 embedding
+        try:
+            self._emb_model = SentenceTransformer(self.model_name)
+            embs = self._emb_model.encode(texts, batch_size=32, show_progress_bar=False)
+            embs = np.asarray(embs, dtype="float32")
+        except Exception as e:
+            return False, f"Embedding failed: {str(e)}"
+
+        # 3) 建 FAISS index
+        try:
+            dim = embs.shape[1]
+            index = faiss.IndexFlatL2(dim)  # L2 distance; 可改 cosine
+            index.add(embs)
+        except Exception as e:
+            return False, f"Building FAISS index failed: {str(e)}"
+
+        # 4) 設定內部狀態
+        self._doc_texts = texts
+        self._index = index
+        self._index_built = True
+        return True, "Index built successfully."
+
+    # ------------------------------------------------------------------
+    # 方便測試：暴露 metadata
+    # ------------------------------------------------------------------
+    def get_metadata(self):
+        metadata = super().get_metadata()
+        metadata["sop_folder"] = self.sop_folder
+        metadata["index_built"] = self._index_built
+        metadata["num_chunks"] = len(self._doc_texts)
+        return metadata
+
+# ----------------------------------------------------------------------
+# CLI / 獨立測試區段
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    """
+    Test command:
+
+    cd octotools/tools/sop_retrieval_tool
+    python tool.py
+    """
+
+    # 取得當前腳本路徑
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    print(f"Script directory: {script_dir}")
+
+    # 假設 SOP txt 檔放在 ./examples/sops/
+    example_sop_dir = os.path.join(script_dir, "examples", "sops")
+
+    tool = SOP_Retrieval_Tool(sop_folder=example_sop_dir, top_k=2)
+
+    # 查看 metadata
+    metadata = tool.get_metadata()
+    print(json.dumps(metadata, indent=2, ensure_ascii=False))
+
+    # 執行查詢
+    try:
+        execution = tool.execute(query="腔體溫度飄移 SOP 解決方案")
+        print("Retrieved SOP Snippet(s):")
+        print(execution)
+    except Exception as e:
+        print(f"Execution failed: {e}")
+
+    print("Done!")
+```
