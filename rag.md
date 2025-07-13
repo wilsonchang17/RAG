@@ -21,6 +21,8 @@ Steps to Implement the RAG Pipeline
 
 Example Implementation
 
+
+## 用sentence-transfoemers的方風
 Below is a simplified example of how you might implement the SOP retrieval using FAISS and an embedding model. This code can be adapted into an OctoTools BaseTool subclass for integration into your agent:
 ```python
 !pip install faiss-cpu sentence-transformers   # install FAISS and embedding model package
@@ -344,4 +346,200 @@ if __name__ == "__main__":
         print(f"Execution failed: {e}")
 
     print("Done!")
+```
+
+## 用TF-IDF / BM25
+```python
+# file: octotools/tools/sop_retrieval_tool/tool.py
+"""
+SOP_Retrieval_Tool  —  TF-IDF / BM25 版本
+
+* 依賴：
+    pip install scikit-learn faiss-cpu           # 如果要 BM25 再多裝 rank_bm25
+
+此版本移除 sentence-transformers，改用 **文字統計向量**：
+1. 預設採用 TF-IDF + 內積（對 L2-norm 後的向量即為 cosine 相似度）。
+2. 若將 `use_bm25=True`，則改用 rank_bm25 套件計算 BM25 分數，不需要 FAISS。（BM25 適合小語料，直接線性掃描即可）
+
+適用情境：公司環境無 CUDA / 不想下載大模型，但 SOP 數量不多。
+"""
+
+import os
+import json
+from typing import List
+
+import numpy as np
+import faiss
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+try:
+    from rank_bm25 import BM25Okapi  # optional
+except ImportError:
+    BM25Okapi = None
+
+from octotools.tools.base import BaseTool
+
+
+class SOP_Retrieval_Tool(BaseTool):
+    """Lightweight SOP 檢索：TF-IDF -> FAISS  or  BM25 (純 Python)"""
+
+    require_llm_engine = False
+
+    def __init__(
+        self,
+        sop_folder: str = "data/sop_texts",
+        top_k: int = 1,
+        use_bm25: bool = False,
+    ):
+        super().__init__(
+            tool_name="SOP_Retrieval_Tool",
+            tool_description=(
+                "Retrieve relevant SOP paragraph(s) for an anomaly query using TF-IDF/"
+                "BM25. Default TF-IDF + FAISS; set use_bm25=True for BM25 scan."
+            ),
+            tool_version="2.0.0",
+            input_types={
+                "query": "str - Anomaly description or user question to search.",
+            },
+            output_type="str - Retrieved SOP paragraph(s).",
+            demo_commands=[
+                {
+                    "command": 'execution = tool.execute(query="腔體溫度飄移 如何處理")',
+                    "description": "Retrieve SOP for chamber temperature drift."
+                },
+                {
+                    "command": 'execution = tool.execute(query="MFC 流量異常 SOP")',
+                    "description": "Retrieve SOP for MFC flow anomaly."
+                },
+            ],
+            user_metadata={
+                "limitation": (
+                    "基於關鍵字的向量，對同義詞/語序變化較敏感；若 SOP 過長或語料大，可考慮升級為 Embedding 版本。"
+                ),
+                "best_practice": (
+                    "1) SOP 文字以段落切分；2) 新增或修改檔案後重建索引；"
+                    "3) 若語意準確度不足，再換成 SentenceTransformer/BERT 版本。"
+                ),
+            },
+        )
+
+        self.sop_folder = sop_folder
+        self.top_k = max(1, top_k)
+        self.use_bm25 = use_bm25 and (BM25Okapi is not None)
+
+        # 延遲建索引
+        self._index_built = False
+        self._doc_texts: List[str] = []
+        self._vectorizer = None
+        self._tfidf_mat = None  # sparse matrix
+        self._faiss_index = None  # 只有 TF-IDF 模式會用到
+        self._bm25 = None        # 只有 BM25 模式會用到
+
+    # ----------------------------------------------------------------------
+    def execute(self, query: str):
+        if not query or not isinstance(query, str):
+            return "Error: `query` must be a non-empty string."
+
+        if not self._index_built:
+            ok, msg = self._build_index()
+            if not ok:
+                return f"Error building SOP index: {msg}"
+
+        if self.use_bm25:
+            return self._bm25_search(query)
+        else:
+            return self._tfidf_faiss_search(query)
+
+    # ----------------------------------------------------------------------
+    # TF-IDF + FAISS 路徑
+    # ----------------------------------------------------------------------
+    def _tfidf_faiss_search(self, query: str):
+        # 將 query 轉 sparse → dense → normalize → 搜
+        q_vec = self._vectorizer.transform([query]).toarray().astype("float32")
+        if q_vec.sum() == 0:
+            return "No relevant SOP found."  # 全新字沒被向量化
+        # L2 normalize -> cosine similarity = dot product
+        faiss.normalize_L2(q_vec)
+        distances, indices = self._faiss_index.search(q_vec, self.top_k)
+        retrieved = [self._doc_texts[i] for i in indices[0] if i < len(self._doc_texts)]
+        return "\n---\n".join(retrieved) if retrieved else "No relevant SOP found."
+
+    # ----------------------------------------------------------------------
+    # BM25 路徑
+    # ----------------------------------------------------------------------
+    def _bm25_search(self, query: str):
+        tokens = query.split()  # 中文環境可接 jieba.lcut
+        scores = self._bm25.get_scores(tokens)
+        top_idx = np.argsort(scores)[::-1][: self.top_k]
+        retrieved = [self._doc_texts[i] for i in top_idx if scores[i] > 0]
+        return "\n---\n".join(retrieved) if retrieved else "No relevant SOP found."
+
+    # ----------------------------------------------------------------------
+    # 建索引 (兩種模式共用) 
+    # ----------------------------------------------------------------------
+    def _build_index(self):
+        if not os.path.isdir(self.sop_folder):
+            return False, f"SOP folder not found: {self.sop_folder}"
+
+        # 讀 txt + chunk
+        texts: List[str] = []
+        for fname in os.listdir(self.sop_folder):
+            if fname.endswith(".txt"):
+                with open(os.path.join(self.sop_folder, fname), "r", encoding="utf-8") as f:
+                    txt = f.read().strip()
+                chunks = [c.strip() for c in txt.split("\n\n") if c.strip()]
+                texts.extend(chunks)
+        if not texts:
+            return False, "No SOP txt files or chunks found."
+
+        self._doc_texts = texts
+
+        if self.use_bm25:
+            if BM25Okapi is None:
+                return False, "rank_bm25 not installed. Run `pip install rank_bm25`."
+            tokenized = [t.split() for t in texts]  # 中文可換 jieba 分詞
+            self._bm25 = BM25Okapi(tokenized)
+        else:
+            # TF-IDF vectorizer
+            self._vectorizer = TfidfVectorizer(token_pattern=r"(?u)\b\w+\b")
+            X = self._vectorizer.fit_transform(texts)
+            dense = X.toarray().astype("float32")
+            faiss.normalize_L2(dense)  # 先正規化，方便用內積算 cosine
+            dim = dense.shape[1]
+            self._faiss_index = faiss.IndexFlatIP(dim)
+            self._faiss_index.add(dense)
+
+        self._index_built = True
+        return True, "Index built successfully."
+
+    # ------------------------------------------------------------------
+    def get_metadata(self):
+        data = super().get_metadata()
+        data.update(
+            {
+                "sop_folder": self.sop_folder,
+                "index_built": self._index_built,
+                "num_chunks": len(self._doc_texts),
+                "mode": "BM25" if self.use_bm25 else "TF-IDF",
+            }
+        )
+        return data
+
+
+# ----------------------------------------------------------------------
+# Stand-alone test
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    example_dir = os.path.join(script_dir, "examples", "sops")
+
+    tool = SOP_Retrieval_Tool(sop_folder=example_dir, top_k=2, use_bm25=False)
+
+    # metadata
+    print(json.dumps(tool.get_metadata(), indent=2, ensure_ascii=False))
+
+    # query
+    ans = tool.execute(query="腔體溫度飄移 SOP 解決方案")
+    print("\nRetrieved:\n", ans)
+
 ```
