@@ -540,6 +540,8 @@ if __name__ == "__main__":
 
     # query# file: octotools/tools/sop_retrieval_tool/tool.py
 """
+```
+## 更新
 SOP_Retrieval_Tool  —  TF-IDF + FAISS 精簡版（完全移除 BM25）
 
 依賴：
@@ -551,7 +553,7 @@ SOP_Retrieval_Tool  —  TF-IDF + FAISS 精簡版（完全移除 BM25）
 3. 查詢時回傳前 `top_k` 最相關段落（用 `---` 分隔）。
 
 適用情境：SOP 文件量有限，需在純 CPU、本地環境快速部署 RAG。 
-"""
+```python
 
 import os
 import json
@@ -697,11 +699,11 @@ if __name__ == "__main__":
 
     ans = tool.execute(query="腔體溫度飄移 SOP 解決方案")
     print("\nRetrieved:\n", ans)
-```
+
     ans = tool.execute(query="腔體溫度飄移 SOP 解決方案")
     print("\nRetrieved:\n", ans)
 
 ```
 
-## 更新
-```python
+
+
