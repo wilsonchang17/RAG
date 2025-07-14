@@ -538,8 +538,170 @@ if __name__ == "__main__":
     # metadata
     print(json.dumps(tool.get_metadata(), indent=2, ensure_ascii=False))
 
-    # query
+    # query# file: octotools/tools/sop_retrieval_tool/tool.py
+"""
+SOP_Retrieval_Tool  —  TF-IDF + FAISS 精簡版（完全移除 BM25）
+
+依賴：
+    pip install scikit-learn faiss-cpu
+
+核心流程：
+1. 以 TF-IDF 向量化每段 SOP 文字（支援中文，可自行替換 tokenizer）。
+2. L2 normalize → 使用 `faiss.IndexFlatIP`，內積即 Cosine 相似度。
+3. 查詢時回傳前 `top_k` 最相關段落（用 `---` 分隔）。
+
+適用情境：SOP 文件量有限，需在純 CPU、本地環境快速部署 RAG。 
+"""
+
+import os
+import json
+from typing import List
+
+import numpy as np
+import faiss
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+from octotools.tools.base import BaseTool
+
+
+class SOP_Retrieval_Tool(BaseTool):
+    """Lightweight SOP 檢索：TF-IDF → FAISS（無 BM25）。"""
+
+    require_llm_engine = False
+
+    def __init__(
+        self,
+        sop_folder: str = "data/sop_texts",
+        top_k: int = 1,
+    ):
+        super().__init__(
+            tool_name="SOP_Retrieval_Tool",
+            tool_description=(
+                "Retrieve relevant SOP paragraph(s) for an anomaly query using TF-IDF + FAISS "
+                "(cosine similarity)."
+            ),
+            tool_version="2.1.0",
+            input_types={
+                "query": "str - Anomaly description or user question to search.",
+            },
+            output_type="str - Retrieved SOP paragraph(s).",
+            demo_commands=[
+                {
+                    "command": 'execution = tool.execute(query="腔體溫度飄移 如何處理")',
+                    "description": "Retrieve SOP for chamber temperature drift."
+                },
+                {
+                    "command": 'execution = tool.execute(query="MFC 流量異常 SOP")',
+                    "description": "Retrieve SOP for MFC flow anomaly."
+                },
+            ],
+            user_metadata={
+                "limitation": (
+                    "基於關鍵字的向量，對同義詞/語序變化較敏感；若精度不足，可改用嵌入式模型。"
+                ),
+                "best_practice": (
+                    "1) 將 SOP 以段落切分；2) 新增/修改檔案後重建索引；"
+                    "3) 查詢可加入關鍵詞，如『SOP』『處理步驟』以提高命中。"
+                ),
+            },
+        )
+
+        self.sop_folder = sop_folder
+        self.top_k = max(1, top_k)
+
+        # 延遲建索引
+        self._index_built = False
+        self._doc_texts: List[str] = []
+        self._vectorizer = None
+        self._faiss_index = None
+
+    # ----------------------------------------------------------------------
+    def execute(self, query: str):
+        if not query or not isinstance(query, str):
+            return "Error: `query` must be a non-empty string."
+
+        if not self._index_built:
+            ok, msg = self._build_index()
+            if not ok:
+                return f"Error building SOP index: {msg}"
+
+        return self._tfidf_faiss_search(query)
+
+    # ----------------------------------------------------------------------
+    # TF-IDF + FAISS 查詢
+    # ----------------------------------------------------------------------
+    def _tfidf_faiss_search(self, query: str):
+        q_vec = self._vectorizer.transform([query]).toarray().astype("float32")
+        if q_vec.sum() == 0:
+            return "No relevant SOP found."
+        faiss.normalize_L2(q_vec)  # cosine
+        _, indices = self._faiss_index.search(q_vec, self.top_k)
+        retrieved = [self._doc_texts[i] for i in indices[0] if i < len(self._doc_texts)]
+        return "\n---\n".join(retrieved) if retrieved else "No relevant SOP found."
+
+    # ----------------------------------------------------------------------
+    # 建索引
+    # ----------------------------------------------------------------------
+    def _build_index(self):
+        if not os.path.isdir(self.sop_folder):
+            return False, f"SOP folder not found: {self.sop_folder}"
+
+        texts: List[str] = []
+        for fname in os.listdir(self.sop_folder):
+            if fname.endswith(".txt"):
+                with open(os.path.join(self.sop_folder, fname), "r", encoding="utf-8") as f:
+                    txt = f.read().strip()
+                chunks = [c.strip() for c in txt.split("\n\n") if c.strip()]
+                texts.extend(chunks)
+        if not texts:
+            return False, "No SOP txt files or chunks found."
+
+        self._doc_texts = texts
+
+        # TF-IDF vectorizer
+        self._vectorizer = TfidfVectorizer(token_pattern=r"(?u)\b\w+\b")
+        X = self._vectorizer.fit_transform(texts)
+        dense = X.toarray().astype("float32")
+        faiss.normalize_L2(dense)
+        dim = dense.shape[1]
+        self._faiss_index = faiss.IndexFlatIP(dim)
+        self._faiss_index.add(dense)
+
+        self._index_built = True
+        return True, "Index built successfully."
+
+    # ------------------------------------------------------------------
+    def get_metadata(self):
+        data = super().get_metadata()
+        data.update(
+            {
+                "sop_folder": self.sop_folder,
+                "index_built": self._index_built,
+                "num_chunks": len(self._doc_texts),
+                "mode": "TF-IDF",
+            }
+        )
+        return data
+
+
+# ----------------------------------------------------------------------
+# Stand-alone test
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    example_dir = os.path.join(script_dir, "examples", "sops")
+
+    tool = SOP_Retrieval_Tool(sop_folder=example_dir, top_k=2)
+
+    print(json.dumps(tool.get_metadata(), indent=2, ensure_ascii=False))
+
+    ans = tool.execute(query="腔體溫度飄移 SOP 解決方案")
+    print("\nRetrieved:\n", ans)
+```
     ans = tool.execute(query="腔體溫度飄移 SOP 解決方案")
     print("\nRetrieved:\n", ans)
 
 ```
+
+## 更新
+```python
